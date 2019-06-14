@@ -8,7 +8,6 @@ import argparse
 import boto3
 from truffleHogRegexes.regexChecks import regexes as hogRegexes
 
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -18,6 +17,7 @@ logger.addHandler(handler)
 
 
 SESSION = boto3.session.Session()
+hogRegexes['Generic Password'] = re.compile('[A-Za-z0-9+_-]{40,255}')
 
 
 def define_params():
@@ -60,7 +60,7 @@ def get_instances(client):
             .get('Reservations', list())
         ]
     ]
-    logger.info('  [%02d] instances fetched.', len(instances))
+    logger.info('  [%d] instances fetched.', len(instances))
     return instances
 
 
@@ -79,12 +79,60 @@ def populate_userdata(client, instances):
     return instances
 
 
+def get_templates(client):
+
+    templates = [
+        {
+            'id': x.get('LaunchTemplateId'),
+            'name': x.get('LaunchTemplateName'),
+            'created_by': x.get('CreatedBy')
+        } for x in (client.describe_launch_templates(
+            MaxResults=200) or dict()).get('LaunchTemplates', list())]
+
+    logger.info('  [%d] templates listed.', len(templates))
+    return templates
+
+
+def populate_templates(client, templates):
+
+    for template in templates:
+        versions = [
+            {
+                'number': x.get('VersionNumber'),
+                'description': x.get('VersionDescription'),
+                'data': x.get('LaunchTemplateData', dict())
+            } for x in (client.describe_launch_template_versions(
+                LaunchTemplateId=template.get('id'), MaxResults=200) or dict())
+            .get('LaunchTemplateVersions', list())]
+
+        logger.info('\t[%d] version found for <%s>', len(
+            versions), template.get('id'))
+
+        for version in versions:
+            content = json.dumps(version['data'])
+            for name, regex in hogRegexes.items():
+                search = regex.search(content)
+                if search:
+                    if template.get('matches'):
+                        template['matches'].append({
+                            'version': version.get('number'), 
+                            'match': search.group()
+                        })
+                    else:
+                        template['matches'] = [{
+                            'version': version.get('number'),
+                            'match': search.group()
+                        }]
+                    logger.info(
+                        '\t  Matched: %s', search.group()[:20] + '...'
+                        if len(search.group()) > 20 else search.group())
+
+
 def check_regexes(instances):
 
     if instances:
         logger.info('  Checking userdata values against regexes...')
 
-    hogRegexes['Generic Password'] = re.compile('[A-Za-z0-9+_-]{20,255}')
     for instance in instances:
         if not instance.get('userdata'):
             continue
@@ -95,50 +143,49 @@ def check_regexes(instances):
             for name, regex in hogRegexes.items():
                 search = regex.search(value)
                 if search:
-                    matches['match'] = search.group()
+                    if instance.get('matches'):
+                        instance['matches'].append({key: search.group()})
+                    else:
+                        instance['matches'] = [{key: search.group()}]
                     try:
-                        matches['value'] = json.loads(value)
+                        instance[key] = json.loads(value)
                     except json.JSONDecodeError:
-                        matches['value'] = value
-
+                        instance[key] = value
                     logger.info(
-                        '    Matched: %s', value[:20] + '...'
-                        if len(value) > 20 else value)
+                        '\tMatched: %s', search.group()[:20] + '...'
+                        if len(search.group()) > 20 else search.group())
                     break
-            if matches:
-                instance['matches'] = matches
-                break
 
+            instance.pop('userdata')
     return instances
 
 
-def write_matches(args, instances, region):
+def write_matches(args, data, region):
 
-    if instances:
-        logger.info('  Writing matches to file...')
+    for entry in data.copy():
+        if not entry.get('matches'):
+            data.remove(entry)
 
-    data = list()
-    for instance in instances:
-        matches = instance.get('matches')
-        if not matches:
-            continue
+    if not data:
+        logger.info(str())
+        return
 
-        entry = {'id': instance.get('id')}
-        entry.update(matches)
-        data.append(entry)
-
+    logger.info('  Writing matches to file...')
     if not os.path.isfile(args.output):
         open(args.output, 'w')
 
-    if data:
-        try:
-            content = json.load(open(args.output))
-        except json.JSONDecodeError:
-            content = dict()
+    try:
+        content = json.load(open(args.output))
+    except json.JSONDecodeError:
+        content = dict()
 
+    if content.get(region):
+        content[region].extend(data)
+    else:
         content[region] = data
-        json.dump(content, open(args.output, 'w'), indent=2)
-        logger.info('  [%s] file updated.', args.output)
+
+    json.dump(content, open(args.output, 'w'), indent=2)
+    logger.info('  [%s] file updated.', args.output)
     logger.info(str())
 
 
@@ -149,15 +196,19 @@ def process_region(args, region):
     instances = get_instances(client)
     populate_userdata(client, instances)
     check_regexes(instances)
+    templates = get_templates(client)
+    populate_templates(client, templates)
     write_matches(args, instances, region)
-    return instances
+    write_matches(args, templates, region)
+    # print(json.dumps(templates, indent=2))
 
 
 if __name__ == "__main__":
 
     args = define_params()
     regions = get_all_regions()
+    if os.path.isfile(args.output):
+        open(args.output, 'w')
 
-    data = list()
     for region in regions:
         process_region(args, region)

@@ -47,5 +47,5 @@ You can control which AWS account to use and what file to output the result in u
   ]
 }
 ```
-**`matches`** list shows what text has been expilictly caught by regexes.  
+**`matches`** list shows what text has been expilictly caught by regexes. Following [regexes](https://github.com/dxa4481/truffleHogRegexes) are used to detect sensitive data from targeted content.  
 **`id`** starting with `i-` refers to EC2 instances and their `userData` matches while **`id`** with prefix `lt-` refers to launch templates and respective sensitive catches.

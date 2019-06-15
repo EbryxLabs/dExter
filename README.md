@@ -24,21 +24,21 @@ You can control which AWS account to use and what file to output the result in u
       }
     },
     {
-      "id": "lt-01af5c9171502dcb8",
+      "id": "lt-01af5e9101501dcb8",
       "name": "lt-t3.large",
-      "created_by": "arn:aws:iam::318060612429:user/ibrahim.ali@ebryx.com",
+      "created_by": "arn:aws:iam::1234567890:user/john.smith@abc.com",
       "matches": [
         {
           "version": 4,
-          "match": "ami-08560f4c1nf6b01e7"
+          "match": "<match-1>"
         },
         {
           "version": 2,
-          "match": "ami-06130a1c6ea6b01e7"
+          "match": "<match-2>"
         },
         {
           "version": 1,
-          "match": "ami-09f0b8b3e42271524"
+          "match": "<match-3>"
         },
         ...
       ]

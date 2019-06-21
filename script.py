@@ -5,19 +5,28 @@ import base64
 import logging
 import argparse
 
+from multiprocessing import Pipe, Process
+
 import boto3
+from botocore.exceptions import ClientError
 from truffleHogRegexes.regexChecks import regexes as hogRegexes
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
-handler.setFormatter(logging.Formatter('%(asctime)s: %(message)s'))
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s: %(message)s'))
 logger.addHandler(handler)
 
 
 SESSION = boto3.session.Session()
-hogRegexes['Generic Password'] = re.compile('[A-Za-z0-9+_-]{40,255}')
+hogRegexes['Generic Password'] = re.compile('[A-Za-z0-9+-]{40,255}')
+
+
+class _ClientError(Exception):
+    pass
 
 
 def define_params():
@@ -52,11 +61,15 @@ def get_instances(client):
     instances = [
         {
             'id': instance[0].get('InstanceId'),
-            'type': instance[0].get('InstanceType')
+            'type': instance[0].get('InstanceType'),
+            'state': instance[0].get('State', dict()).get('Name', str())
         } for instance in
         [
             reserve.get('Instances', list()) for reserve in
-            (client.describe_instances(MaxResults=999) or dict())
+            (client.describe_instances(Filters=[{
+                'Name': 'instance-state-name',
+                'Values': ['running', 'stopped']
+            }], MaxResults=999) or dict())
             .get('Reservations', list())
         ]
     ]
@@ -67,16 +80,34 @@ def get_instances(client):
 def populate_userdata(client, instances):
 
     for instance in instances:
-        userdata = (client.describe_instance_attribute(
-            Attribute='userData', InstanceId=instance.get('id')) or dict()) \
-            .get('UserData', dict())
+        try:
+            userdata = (client.describe_instance_attribute(
+                Attribute='userData', InstanceId=instance.get(
+                    'id')) or dict()).get('UserData', dict())
 
-        if userdata:
-            logger.info('    [%d] values found for <%s>.',
-                        len(userdata), instance.get('id'))
-        instance['userdata'] = userdata
+            if userdata:
+                logger.info('    [%d] values found for <%s>.',
+                            len(userdata), instance.get('id'))
+                instance['userdata'] = userdata
+        except ClientError as exc:
+            if 'InvalidInstanceID.NotFound' not in str(exc):
+                raise _ClientError(str(exc))
 
-    return instances
+
+def populate_tags(client, instances):
+
+    logger.info('  Populating resource tags...')
+    tags = (client.describe_tags(
+        MaxResults=1000) or dict()).get('Tags', list())
+
+    count = 0
+    for instance in instances:
+        for tag in tags:
+            if not tag.get('ResourceId') == instance.get('id'):
+                continue
+            instance['name'] = tag.get('Value')
+            count += 1
+    logger.info('    [%d] tags populated.', count)
 
 
 def get_templates(client):
@@ -109,6 +140,10 @@ def populate_templates(client, templates):
             versions), template.get('id'))
 
         for version in versions:
+            if version['data'].get('UserData'):
+                version['data']['UserData'] = base64.b64decode(
+                    version['data']['UserData']).decode('utf8')
+
             content = json.dumps(version['data'])
             for name, regex in hogRegexes.items():
                 search = regex.search(content)
@@ -167,7 +202,6 @@ def write_matches(args, data, region):
             data.remove(entry)
 
     if not data:
-        logger.info(str())
         return
 
     logger.info('  Writing matches to file...')
@@ -189,18 +223,20 @@ def write_matches(args, data, region):
     logger.info(str())
 
 
-def process_region(args, region):
+def process_region(args, region, pchild):
 
     logger.info('Fetching details from <%s>.', region)
     client = SESSION.client('ec2', region_name=region)
     instances = get_instances(client)
     populate_userdata(client, instances)
+    populate_tags(client, instances)
+
     check_regexes(instances)
+    write_matches(args, instances, region)
+
     templates = get_templates(client)
     populate_templates(client, templates)
-    write_matches(args, instances, region)
     write_matches(args, templates, region)
-    # print(json.dumps(templates, indent=2))
 
 
 if __name__ == "__main__":
@@ -210,5 +246,12 @@ if __name__ == "__main__":
     if os.path.isfile(args.output):
         open(args.output, 'w')
 
+    conns, processes = list(), list()
     for region in regions:
-        process_region(args, region)
+        parent, child = Pipe()
+        process = Process(target=process_region, args=(args, region, child))
+        processes.append(process)
+        process.start()
+
+    for process in processes:
+        process.join()
